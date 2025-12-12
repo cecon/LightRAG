@@ -151,11 +151,21 @@ class LightRAG:
     doc_status_storage: str = field(default="JsonDocStatusStorage")
     """Storage type for tracking document processing statuses."""
 
-    # Workspace
+    # Workspace & Multi-Tenancy
     # ---
 
     workspace: str = field(default_factory=lambda: os.getenv("WORKSPACE", ""))
     """Workspace for data isolation. Defaults to empty string if WORKSPACE environment variable is not set."""
+
+    tenant_id: str = field(
+        default_factory=lambda: os.getenv("DEFAULT_TENANT_ID", "default")
+    )
+    """Tenant ID for multi-tenant isolation. Different tenants have completely isolated data. Defaults to 'default' if DEFAULT_TENANT_ID environment variable is not set."""
+
+    project_id: str = field(
+        default_factory=lambda: os.getenv("DEFAULT_PROJECT_ID", "default")
+    )
+    """Project ID for multi-project isolation within a tenant. Different projects have completely isolated data. Defaults to 'default' if DEFAULT_PROJECT_ID environment variable is not set."""
 
     # Logging (Deprecated, use setup_logger in utils.py instead)
     # ---
@@ -567,6 +577,8 @@ class LightRAG:
         self.llm_response_cache: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_LLM_RESPONSE_CACHE,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             global_config=global_config,
             embedding_func=self.embedding_func,
         )
@@ -574,60 +586,80 @@ class LightRAG:
         self.text_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_TEXT_CHUNKS,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             embedding_func=self.embedding_func,
         )
 
         self.full_docs: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_FULL_DOCS,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             embedding_func=self.embedding_func,
         )
 
         self.full_entities: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_FULL_ENTITIES,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             embedding_func=self.embedding_func,
         )
 
         self.full_relations: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_FULL_RELATIONS,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             embedding_func=self.embedding_func,
         )
 
         self.entity_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_ENTITY_CHUNKS,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             embedding_func=self.embedding_func,
         )
 
         self.relation_chunks: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=NameSpace.KV_STORE_RELATION_CHUNKS,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             embedding_func=self.embedding_func,
         )
 
         self.chunk_entity_relation_graph: BaseGraphStorage = self.graph_storage_cls(  # type: ignore
             namespace=NameSpace.GRAPH_STORE_CHUNK_ENTITY_RELATION,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             embedding_func=self.embedding_func,
         )
 
         self.entities_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_ENTITIES,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             embedding_func=self.embedding_func,
             meta_fields={"entity_name", "source_id", "content", "file_path"},
         )
         self.relationships_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_RELATIONSHIPS,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             embedding_func=self.embedding_func,
             meta_fields={"src_id", "tgt_id", "source_id", "content", "file_path"},
         )
         self.chunks_vdb: BaseVectorStorage = self.vector_db_storage_cls(  # type: ignore
             namespace=NameSpace.VECTOR_STORE_CHUNKS,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             embedding_func=self.embedding_func,
             meta_fields={"full_doc_id", "content", "file_path"},
         )
@@ -636,6 +668,8 @@ class LightRAG:
         self.doc_status: DocStatusStorage = self.doc_status_storage_cls(
             namespace=NameSpace.DOC_STATUS,
             workspace=self.workspace,
+            tenant_id=self.tenant_id,
+            project_id=self.project_id,
             global_config=global_config,
             embedding_func=None,
         )

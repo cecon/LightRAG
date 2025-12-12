@@ -1,4 +1,34 @@
 services:
+  postgres:
+    image: apache/age:latest
+    container_name: lightrag-postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-lightrag}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-lightrag_password}
+      - POSTGRES_DB=${POSTGRES_DATABASE:-lightrag}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./init-auth-tables.sql:/docker-entrypoint-initdb.d/02-auth-tables.sql
+      - ./init-api-keys-table.sql:/docker-entrypoint-initdb.d/03-api-keys.sql
+      - ./init-llm-configs-table.sql:/docker-entrypoint-initdb.d/04-llm-configs.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lightrag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+      -c shared_preload_libraries=age
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c work_mem=16MB
+      -c maintenance_work_mem=128MB
+      -c effective_cache_size=1GB
+
   lightrag:
     container_name: lightrag
     image: ghcr.io/hkuds/lightrag:latest
@@ -9,13 +39,22 @@ services:
         - ghcr.io/hkuds/lightrag:latest
     ports:
       - "${PORT:-9621}:9621"
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - ./data/rag_storage:/app/data/rag_storage
       - ./data/inputs:/app/data/inputs
       - ./config.ini:/app/config.ini
       - ./.env:/app/.env
+      # Mount local code for development (multi-tenant features)
+      - ./lightrag:/app/lightrag
     env_file:
       - .env
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+volumes:
+  postgres_data:
+    driver: local

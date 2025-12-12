@@ -3,8 +3,9 @@ This module contains all query-related routes for the LightRAG API.
 """
 
 import json
-from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Any, Callable, Dict, List, Literal, Optional
+from fastapi import APIRouter, Depends, HTTPException, Request
+from lightrag import LightRAG
 from lightrag.base import QueryParam
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.utils import logger
@@ -190,7 +191,19 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def create_query_routes(
+    api_key: Optional[str] = None,
+    top_k: int = 60,
+    get_rag_instance: Optional[Callable[[Request], LightRAG]] = None,
+):
+    """
+    Create query routes for the LightRAG API.
+    
+    Args:
+        api_key: Optional API key for authentication
+        top_k: Default number of top items to retrieve
+        get_rag_instance: Dependency function to get LightRAG instance for request
+    """
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.post(
@@ -322,7 +335,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(http_request: Request, request: QueryRequest):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -382,6 +395,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         ```
 
         Args:
+            http_request (Request): FastAPI Request object (for multi-tenant routing)
             request (QueryRequest): The request object containing query parameters:
                 - **query**: The question or prompt to process (min 3 characters)
                 - **mode**: Query strategy - "mix" recommended for best results
@@ -402,6 +416,9 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 - 500: Internal processing error (e.g., LLM service unavailable)
         """
         try:
+            # Get the LightRAG instance for this tenant/project
+            rag = await get_rag_instance(http_request)
+            
             param = request.to_query_params(
                 False
             )  # Ensure stream=False for non-streaming endpoint

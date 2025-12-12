@@ -52,6 +52,7 @@ from lightrag.api.routers.document_routes import (
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.instance_manager import LightRAGInstanceManager
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -351,22 +352,89 @@ def create_app(args):
         """Lifespan context manager for startup and shutdown events"""
         # Store background tasks
         app.state.background_tasks = set()
+        
+        # Initialize database connection pool for multi-tenant auth/config
+        db_pool = None
+        auth_service = None
+        project_service = None
+        api_key_service = None
+        llm_config_service = None
+        
+        try:
+            # Create PostgreSQL connection pool if multi-tenant is enabled
+            if os.getenv("LIGHTRAG_MULTI_TENANT", "false").lower() == "true":
+                import asyncpg
+                
+                logger.info("Initializing multi-tenant database connection pool...")
+                db_pool = await asyncpg.create_pool(
+                    host=os.getenv("POSTGRES_HOST", "localhost"),
+                    port=int(os.getenv("POSTGRES_PORT", "5432")),
+                    database=os.getenv("POSTGRES_DB", "lightrag"),
+                    user=os.getenv("POSTGRES_USER", "lightrag"),
+                    password=os.getenv("POSTGRES_PASSWORD", "lightrag"),
+                    min_size=5,
+                    max_size=20,
+                    command_timeout=60
+                )
+                
+                # Initialize services
+                from lightrag.api.services.auth_service import AuthService
+                from lightrag.api.services.project_service import ProjectService
+                from lightrag.api.services.api_key_service import APIKeyService
+                from lightrag.api.services.llm_config_service import LLMConfigService
+                
+                # Get JWT configuration from environment
+                jwt_secret = os.getenv("JWT_SECRET_KEY")
+                if not jwt_secret:
+                    raise ValueError("JWT_SECRET_KEY environment variable is required for multi-tenant mode")
+                
+                access_token_expire = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+                refresh_token_expire = int(os.getenv("JWT_REFRESH_TOKEN_EXPIRE_DAYS", "30"))
+                
+                auth_service = AuthService(
+                    db_pool,
+                    secret_key=jwt_secret,
+                    access_token_expire_minutes=access_token_expire,
+                    refresh_token_expire_days=refresh_token_expire
+                )
+                project_service = ProjectService(db_pool)
+                api_key_service = APIKeyService(db_pool)
+                llm_config_service = LLMConfigService(db_pool)
+                
+                # Store services in app state
+                app.state.db_pool = db_pool
+                app.state.auth_service = auth_service
+                app.state.project_service = project_service
+                app.state.api_key_service = api_key_service
+                app.state.llm_config_service = llm_config_service
+                
+                # Update instance_manager with llm_config_service
+                instance_manager.llm_config_service = llm_config_service
+                
+                logger.info("Multi-tenant services initialized successfully")
+        
+        except Exception as e:
+            logger.error(f"Failed to initialize multi-tenant services: {e}")
+            logger.warning("Continuing without multi-tenant support")
+        
+        # Store instance manager in app state for route access
+        app.state.instance_manager = instance_manager
 
         try:
-            # Initialize database connections
-            # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
-            await rag.initialize_storages()
-
-            # Data migration regardless of storage implementation
-            await rag.check_and_migrate_data()
-
+            # Note: Individual LightRAG instances will initialize their storages
+            # when first accessed through the instance manager
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield
 
         finally:
-            # Clean up database connections
-            await rag.finalize_storages()
+            # Clean up instance manager and all cached instances
+            await instance_manager.shutdown()
+            
+            # Close database pool
+            if db_pool:
+                logger.info("Closing database connection pool...")
+                await db_pool.close()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
@@ -477,6 +545,102 @@ def create_app(args):
             workspace = None
 
         return workspace
+
+    def get_tenant_id_from_request(request: Request) -> str:
+        """
+        Extract tenant ID from HTTP request header or use default.
+
+        This enables multi-tenant API support by checking the custom
+        'X-Tenant-ID' header. If not present, falls back to 'default'.
+
+        Args:
+            request: FastAPI Request object
+
+        Returns:
+            Tenant identifier (defaults to 'default')
+        """
+        tenant_id = request.headers.get("X-Tenant-ID", "").strip()
+        if not tenant_id:
+            tenant_id = os.getenv("DEFAULT_TENANT_ID", "default")
+        return tenant_id
+
+    def get_project_id_from_request(request: Request) -> str:
+        """
+        Extract project ID from HTTP request header or use default.
+
+        This enables multi-project API support by checking the custom
+        'X-Project-ID' header. If not present, falls back to 'default'.
+
+        Args:
+            request: FastAPI Request object
+
+        Returns:
+            Project identifier (defaults to 'default')
+        """
+        project_id = request.headers.get("X-Project-ID", "").strip()
+        if not project_id:
+            project_id = os.getenv("DEFAULT_PROJECT_ID", "default")
+        return project_id
+    
+    async def get_rag_instance(request: Request) -> LightRAG:
+        """
+        FastAPI dependency that provides the correct LightRAG instance for the request.
+        
+        Supports two authentication methods:
+        1. JWT Bearer Token + Headers: Uses X-Tenant-ID and X-Project-ID headers
+        2. API Key: Automatically extracts tenant_id and project_id from API key context
+        
+        This can be used as a dependency in route handlers:
+        ```python
+        @router.post("/endpoint")
+        async def my_endpoint(rag: LightRAG = Depends(get_rag_instance)):
+            result = await rag.query(...)
+        ```
+        
+        Args:
+            request: FastAPI Request object
+            
+        Returns:
+            LightRAG instance configured for this tenant/project
+            
+        Raises:
+            HTTPException: If authentication is invalid or project access denied
+        """
+        auth_type = getattr(request.state, "auth_type", None)
+        
+        # API Key authentication - get tenant/project from key context
+        if auth_type == "api_key":
+            tenant_id = getattr(request.state, "tenant_id", None)
+            project_id = getattr(request.state, "project_id", None)
+            
+            if not tenant_id or not project_id:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid API key context"
+                )
+                
+        # JWT authentication - get tenant/project from headers
+        else:
+            tenant_id = get_tenant_id_from_request(request)
+            project_id = get_project_id_from_request(request)
+            
+            # Verify user has access to this project (if project service available)
+            if hasattr(request.app.state, "project_service"):
+                user_id = getattr(request.state, "user_id", None)
+                if user_id:
+                    access = await request.app.state.project_service.check_user_access(
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        project_id=project_id
+                    )
+                    if not access:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="You don't have access to this project"
+                        )
+        
+        # Get or create instance from the manager
+        return await instance_manager.get_instance(tenant_id, project_id)
 
     # Create working directory if it doesn't exist
     Path(args.working_dir).mkdir(parents=True, exist_ok=True)
@@ -1041,60 +1205,100 @@ def create_app(args):
         name=args.simulated_model_name, tag=args.simulated_model_tag
     )
 
-    # Initialize RAG with unified configuration
+    # Initialize LightRAG Instance Manager for multi-tenant support
+    # This creates a pool of LightRAG instances, one per (tenant_id, project_id) combination
     try:
-        rag = LightRAG(
-            working_dir=args.working_dir,
-            workspace=args.workspace,
-            llm_model_func=create_llm_model_func(args.llm_binding),
-            llm_model_name=args.llm_model,
-            llm_model_max_async=args.max_async,
-            summary_max_tokens=args.summary_max_tokens,
-            summary_context_size=args.summary_context_size,
-            chunk_token_size=int(args.chunk_size),
-            chunk_overlap_token_size=int(args.chunk_overlap_size),
-            llm_model_kwargs=create_llm_model_kwargs(
+        base_config = {
+            "working_dir": args.working_dir,
+            "workspace": args.workspace,
+            # Note: tenant_id and project_id will be set per-instance by the manager
+            "llm_model_func": create_llm_model_func(args.llm_binding),
+            "llm_model_name": args.llm_model,
+            "llm_model_max_async": args.max_async,
+            "summary_max_tokens": args.summary_max_tokens,
+            "summary_context_size": args.summary_context_size,
+            "chunk_token_size": int(args.chunk_size),
+            "chunk_overlap_token_size": int(args.chunk_overlap_size),
+            "llm_model_kwargs": create_llm_model_kwargs(
                 args.llm_binding, args, llm_timeout
             ),
-            embedding_func=embedding_func,
-            default_llm_timeout=llm_timeout,
-            default_embedding_timeout=embedding_timeout,
-            kv_storage=args.kv_storage,
-            graph_storage=args.graph_storage,
-            vector_storage=args.vector_storage,
-            doc_status_storage=args.doc_status_storage,
-            vector_db_storage_cls_kwargs={
+            "embedding_func": embedding_func,
+            "default_llm_timeout": llm_timeout,
+            "default_embedding_timeout": embedding_timeout,
+            "kv_storage": args.kv_storage,
+            "graph_storage": args.graph_storage,
+            "vector_storage": args.vector_storage,
+            "doc_status_storage": args.doc_status_storage,
+            "vector_db_storage_cls_kwargs": {
                 "cosine_better_than_threshold": args.cosine_threshold
             },
-            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
-            enable_llm_cache=args.enable_llm_cache,
-            rerank_model_func=rerank_model_func,
-            max_parallel_insert=args.max_parallel_insert,
-            max_graph_nodes=args.max_graph_nodes,
-            addon_params={
+            "enable_llm_cache_for_entity_extract": args.enable_llm_cache_for_extract,
+            "enable_llm_cache": args.enable_llm_cache,
+            "rerank_model_func": rerank_model_func,
+            "max_parallel_insert": args.max_parallel_insert,
+            "max_graph_nodes": args.max_graph_nodes,
+            "addon_params": {
                 "language": args.summary_language,
                 "entity_types": args.entity_types,
             },
-            ollama_server_infos=ollama_server_infos,
+            "ollama_server_infos": ollama_server_infos,
+        }
+        
+        # Get instance pool configuration from environment
+        max_instances = int(os.getenv("LIGHTRAG_MAX_INSTANCES", "100"))
+        ttl_minutes = int(os.getenv("LIGHTRAG_INSTANCE_TTL_MINUTES", "60"))
+        
+        instance_manager = LightRAGInstanceManager(
+            base_config=base_config,
+            max_instances=max_instances,
+            ttl_minutes=ttl_minutes,
+        )
+        
+        logger.info(
+            f"LightRAG Instance Manager initialized: "
+            f"max_instances={max_instances}, ttl={ttl_minutes}min"
         )
     except Exception as e:
-        logger.error(f"Failed to initialize LightRAG: {e}")
+        logger.error(f"Failed to initialize LightRAG Instance Manager: {e}")
         raise
 
-    # Add routes
+    # Add routes with multi-tenant support
+    # Routes receive get_rag_instance dependency to get correct instance per request
     app.include_router(
         create_document_routes(
-            rag,
             doc_manager,
             api_key,
+            get_rag_instance,
         )
     )
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
+    app.include_router(create_query_routes(api_key, args.top_k, get_rag_instance))
+    app.include_router(create_graph_routes(api_key, get_rag_instance))
 
-    # Add Ollama API routes
-    ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
-    app.include_router(ollama_api.router, prefix="/api")
+    # TODO: Add Ollama API support for multi-tenant mode
+    # ollama_api = OllamaAPI(rag=rag, top_k=args.top_k, api_key=api_key)
+    # app.include_router(ollama_api.router, prefix="/api")
+    
+    # Add multi-tenant authentication and configuration routes (if enabled)
+    if os.getenv("LIGHTRAG_MULTI_TENANT", "false").lower() == "true":
+        try:
+            from lightrag.api.routers.auth_routes import router as auth_router
+            from lightrag.api.routers.project_routes import router as project_router
+            from lightrag.api.routers.api_key_routes import router as api_key_router
+            from lightrag.api.routers.llm_config_routes import router as llm_config_router
+            from lightrag.api.middleware.auth_middleware import AuthMiddleware
+            
+            # Include multi-tenant routers first
+            app.include_router(auth_router)
+            app.include_router(project_router)
+            app.include_router(api_key_router)
+            app.include_router(llm_config_router)
+            
+            logger.info("Multi-tenant API routes enabled")
+            
+            # Note: Authentication middleware will be added in lifespan after services are initialized
+        except Exception as e:
+            logger.warning(f"Failed to load multi-tenant routes: {e}")
+            logger.warning("Continuing without multi-tenant API support")
 
     # Custom Swagger UI endpoint for offline support
     @app.get("/docs", include_in_schema=False)
@@ -1285,6 +1489,7 @@ def create_app(args):
                 "auth_mode": auth_mode,
                 "pipeline_busy": pipeline_status.get("busy", False),
                 "keyed_locks": keyed_lock_info,
+                "instance_manager": instance_manager.get_stats(),
                 "core_version": core_version,
                 "api_version": api_version_display,
                 "webui_title": webui_title,

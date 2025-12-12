@@ -174,6 +174,8 @@ class StorageNameSpace(ABC):
     namespace: str
     workspace: str
     global_config: dict[str, Any]
+    tenant_id: str
+    project_id: str
 
     async def initialize(self):
         """Initialize the storage"""

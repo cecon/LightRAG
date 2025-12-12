@@ -1722,7 +1722,15 @@ class PGKVStorage(BaseKVStorage):
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
         """Get data by id."""
         sql = SQL_TEMPLATES["get_by_id_" + self.namespace]
-        params = {"workspace": self.workspace, "id": id}
+        # Multi-tenant isolation: always filter by tenant_id, project_id, and workspace
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
+        params = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workspace": self.workspace,
+            "id": id,
+        }
         response = await self.db.query(sql, list(params.values()))
 
         if response and is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
@@ -1835,7 +1843,15 @@ class PGKVStorage(BaseKVStorage):
             return []
 
         sql = SQL_TEMPLATES["get_by_ids_" + self.namespace]
-        params = {"workspace": self.workspace, "ids": ids}
+        # Multi-tenant isolation: always filter by tenant_id, project_id, and workspace
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
+        params = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workspace": self.workspace,
+            "ids": ids,
+        }
         results = await self.db.query(sql, list(params.values()), multirows=True)
 
         def _order_results(
@@ -1969,13 +1985,20 @@ class PGKVStorage(BaseKVStorage):
         return _order_results(results)
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
-        """Filter out duplicated content"""
+        """Filter out duplicated content - with multi-tenant isolation"""
         if not keys:
             return set()
 
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
         table_name = namespace_to_table_name(self.namespace)
-        sql = f"SELECT id FROM {table_name} WHERE workspace=$1 AND id = ANY($2)"
-        params = {"workspace": self.workspace, "ids": list(keys)}
+        sql = f"SELECT id FROM {table_name} WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id = ANY($4)"
+        params = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workspace": self.workspace,
+            "ids": list(keys),
+        }
         try:
             res = await self.db.query(sql, list(params.values()), multirows=True)
             if res:
@@ -1986,7 +2009,7 @@ class PGKVStorage(BaseKVStorage):
             return new_keys
         except Exception as e:
             logger.error(
-                f"[{self.workspace}] PostgreSQL database,\nsql:{sql},\nparams:{params},\nerror:{e}"
+                f"[tenant={tenant_id}][project={project_id}][{self.workspace}] PostgreSQL database,\nsql:{sql},\nparams:{params},\nerror:{e}"
             )
             raise
 
@@ -2002,6 +2025,8 @@ class PGKVStorage(BaseKVStorage):
             for k, v in data.items():
                 upsert_sql = SQL_TEMPLATES["upsert_text_chunk"]
                 _data = {
+                    "tenant_id": self.tenant_id or "default",
+                    "project_id": self.project_id or "default",
                     "workspace": self.workspace,
                     "id": k,
                     "tokens": v["tokens"],
@@ -2018,6 +2043,8 @@ class PGKVStorage(BaseKVStorage):
             for k, v in data.items():
                 upsert_sql = SQL_TEMPLATES["upsert_doc_full"]
                 _data = {
+                    "tenant_id": self.tenant_id or "default",
+                    "project_id": self.project_id or "default",
                     "id": k,
                     "content": v["content"],
                     "doc_name": v.get("file_path", ""),  # Map file_path to doc_name
@@ -2028,6 +2055,8 @@ class PGKVStorage(BaseKVStorage):
             for k, v in data.items():
                 upsert_sql = SQL_TEMPLATES["upsert_llm_response_cache"]
                 _data = {
+                    "tenant_id": self.tenant_id or "default",
+                    "project_id": self.project_id or "default",
                     "workspace": self.workspace,
                     "id": k,  # Use flattened key as id
                     "original_prompt": v["original_prompt"],
@@ -2048,6 +2077,8 @@ class PGKVStorage(BaseKVStorage):
             for k, v in data.items():
                 upsert_sql = SQL_TEMPLATES["upsert_full_entities"]
                 _data = {
+                    "tenant_id": self.tenant_id or "default",
+                    "project_id": self.project_id or "default",
                     "workspace": self.workspace,
                     "id": k,
                     "entity_names": json.dumps(v["entity_names"]),
@@ -2062,6 +2093,8 @@ class PGKVStorage(BaseKVStorage):
             for k, v in data.items():
                 upsert_sql = SQL_TEMPLATES["upsert_full_relations"]
                 _data = {
+                    "tenant_id": self.tenant_id or "default",
+                    "project_id": self.project_id or "default",
                     "workspace": self.workspace,
                     "id": k,
                     "relation_pairs": json.dumps(v["relation_pairs"]),
@@ -2076,6 +2109,8 @@ class PGKVStorage(BaseKVStorage):
             for k, v in data.items():
                 upsert_sql = SQL_TEMPLATES["upsert_entity_chunks"]
                 _data = {
+                    "tenant_id": self.tenant_id or "default",
+                    "project_id": self.project_id or "default",
                     "workspace": self.workspace,
                     "id": k,
                     "chunk_ids": json.dumps(v["chunk_ids"]),
@@ -2090,6 +2125,8 @@ class PGKVStorage(BaseKVStorage):
             for k, v in data.items():
                 upsert_sql = SQL_TEMPLATES["upsert_relation_chunks"]
                 _data = {
+                    "tenant_id": self.tenant_id or "default",
+                    "project_id": self.project_id or "default",
                     "workspace": self.workspace,
                     "id": k,
                     "chunk_ids": json.dumps(v["chunk_ids"]),
@@ -2157,8 +2194,10 @@ class PGKVStorage(BaseKVStorage):
             )
 
     async def drop(self) -> dict[str, str]:
-        """Drop the storage"""
+        """Drop the storage - with multi-tenant isolation"""
         try:
+            tenant_id = self.tenant_id or "default"
+            project_id = self.project_id or "default"
             table_name = namespace_to_table_name(self.namespace)
             if not table_name:
                 return {
@@ -2169,7 +2208,14 @@ class PGKVStorage(BaseKVStorage):
             drop_sql = SQL_TEMPLATES["drop_specifiy_table_workspace"].format(
                 table_name=table_name
             )
-            await self.db.execute(drop_sql, {"workspace": self.workspace})
+            await self.db.execute(
+                drop_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "project_id": project_id,
+                    "workspace": self.workspace,
+                },
+            )
             return {"status": "success", "message": "data dropped"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -2217,6 +2263,8 @@ class PGVectorStorage(BaseVectorStorage):
         try:
             upsert_sql = SQL_TEMPLATES["upsert_chunk"]
             data: dict[str, Any] = {
+                "tenant_id": self.tenant_id or "default",
+                "project_id": self.project_id or "default",
                 "workspace": self.workspace,
                 "id": item["__id__"],
                 "tokens": item["tokens"],
@@ -2247,6 +2295,8 @@ class PGVectorStorage(BaseVectorStorage):
             chunk_ids = [source_id]
 
         data: dict[str, Any] = {
+            "tenant_id": self.tenant_id or "default",
+            "project_id": self.project_id or "default",
             "workspace": self.workspace,
             "id": item["__id__"],
             "entity_name": item["entity_name"],
@@ -2270,6 +2320,8 @@ class PGVectorStorage(BaseVectorStorage):
             chunk_ids = [source_id]
 
         data: dict[str, Any] = {
+            "tenant_id": self.tenant_id or "default",
+            "project_id": self.project_id or "default",
             "workspace": self.workspace,
             "id": item["__id__"],
             "source_id": item["src_id"],
@@ -2336,7 +2388,12 @@ class PGVectorStorage(BaseVectorStorage):
         embedding_string = ",".join(map(str, embedding))
 
         sql = SQL_TEMPLATES[self.namespace].format(embedding_string=embedding_string)
+        # Multi-tenant isolation: include tenant_id and project_id in queries
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
         params = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
             "workspace": self.workspace,
             "closer_than_threshold": 1 - self.cosine_better_than_threshold,
             "top_k": top_k,
@@ -2544,8 +2601,10 @@ class PGVectorStorage(BaseVectorStorage):
             return {}
 
     async def drop(self) -> dict[str, str]:
-        """Drop the storage"""
+        """Drop the storage - with multi-tenant isolation"""
         try:
+            tenant_id = self.tenant_id or "default"
+            project_id = self.project_id or "default"
             table_name = namespace_to_table_name(self.namespace)
             if not table_name:
                 return {
@@ -2556,7 +2615,14 @@ class PGVectorStorage(BaseVectorStorage):
             drop_sql = SQL_TEMPLATES["drop_specifiy_table_workspace"].format(
                 table_name=table_name
             )
-            await self.db.execute(drop_sql, {"workspace": self.workspace})
+            await self.db.execute(
+                drop_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "project_id": project_id,
+                    "workspace": self.workspace,
+                },
+            )
             return {"status": "success", "message": "data dropped"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -2599,13 +2665,20 @@ class PGDocStatusStorage(DocStatusStorage):
             self.db = None
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
-        """Filter out duplicated content"""
+        """Filter out duplicated content - with multi-tenant isolation"""
         if not keys:
             return set()
 
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
         table_name = namespace_to_table_name(self.namespace)
-        sql = f"SELECT id FROM {table_name} WHERE workspace=$1 AND id = ANY($2)"
-        params = {"workspace": self.workspace, "ids": list(keys)}
+        sql = f"SELECT id FROM {table_name} WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id = ANY($4)"
+        params = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workspace": self.workspace,
+            "ids": list(keys),
+        }
         try:
             res = await self.db.query(sql, list(params.values()), multirows=True)
             if res:
@@ -2618,13 +2691,20 @@ class PGDocStatusStorage(DocStatusStorage):
             return new_keys
         except Exception as e:
             logger.error(
-                f"[{self.workspace}] PostgreSQL database,\nsql:{sql},\nparams:{params},\nerror:{e}"
+                f"[tenant={tenant_id}][project={project_id}][{self.workspace}] PostgreSQL database,\nsql:{sql},\nparams:{params},\nerror:{e}"
             )
             raise
 
     async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
-        sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and id=$2"
-        params = {"workspace": self.workspace, "id": id}
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
+        sql = "select * from LIGHTRAG_DOC_STATUS where tenant_id=$1 and project_id=$2 and workspace=$3 and id=$4"
+        params = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workspace": self.workspace,
+            "id": id,
+        }
         result = await self.db.query(sql, list(params.values()), True)
         if result is None or result == []:
             return None
@@ -2668,8 +2748,15 @@ class PGDocStatusStorage(DocStatusStorage):
         if not ids:
             return []
 
-        sql = "SELECT * FROM LIGHTRAG_DOC_STATUS WHERE workspace=$1 AND id = ANY($2)"
-        params = {"workspace": self.workspace, "ids": ids}
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
+        sql = "SELECT * FROM LIGHTRAG_DOC_STATUS WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id = ANY($4)"
+        params = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workspace": self.workspace,
+            "ids": ids,
+        }
 
         results = await self.db.query(sql, list(params.values()), True)
 
@@ -2728,8 +2815,15 @@ class PGDocStatusStorage(DocStatusStorage):
             Union[dict[str, Any], None]: Document data if found, None otherwise
             Returns the same format as get_by_id method
         """
-        sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and file_path=$2"
-        params = {"workspace": self.workspace, "file_path": file_path}
+        sql = "select * from LIGHTRAG_DOC_STATUS where tenant_id=$1 and project_id=$2 and workspace=$3 and file_path=$4"
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
+        params = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workspace": self.workspace,
+            "file_path": file_path,
+        }
         result = await self.db.query(sql, list(params.values()), True)
 
         if result is None or result == []:
@@ -2786,8 +2880,15 @@ class PGDocStatusStorage(DocStatusStorage):
         self, status: DocStatus
     ) -> dict[str, DocProcessingStatus]:
         """all documents with a specific status"""
-        sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and status=$2"
-        params = {"workspace": self.workspace, "status": status.value}
+        sql = "select * from LIGHTRAG_DOC_STATUS where tenant_id=$1 and project_id=$2 and workspace=$3 and status=$4"
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
+        params = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workspace": self.workspace,
+            "status": status.value,
+        }
         result = await self.db.query(sql, list(params.values()), True)
 
         docs_by_status = {}
@@ -2840,8 +2941,15 @@ class PGDocStatusStorage(DocStatusStorage):
         self, track_id: str
     ) -> dict[str, DocProcessingStatus]:
         """Get all documents with a specific track_id"""
-        sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and track_id=$2"
-        params = {"workspace": self.workspace, "track_id": track_id}
+        sql = "select * from LIGHTRAG_DOC_STATUS where tenant_id=$1 and project_id=$2 and workspace=$3 and track_id=$4"
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
+        params = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workspace": self.workspace,
+            "track_id": track_id,
+        }
         result = await self.db.query(sql, list(params.values()), True)
 
         docs_by_track_id = {}
@@ -2932,17 +3040,23 @@ class PGDocStatusStorage(DocStatusStorage):
         # Calculate offset
         offset = (page - 1) * page_size
 
-        # Build parameterized query components
-        params = {"workspace": self.workspace}
-        param_count = 1
+        # Build parameterized query components - with multi-tenant isolation
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
+        params = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workspace": self.workspace,
+        }
+        param_count = 3
 
-        # Build WHERE clause with parameterized query
+        # Build WHERE clause with parameterized query including tenant_id and project_id
         if status_filter is not None:
             param_count += 1
-            where_clause = "WHERE workspace=$1 AND status=$2"
+            where_clause = f"WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND status=${param_count}"
             params["status"] = status_filter.value
         else:
-            where_clause = "WHERE workspace=$1"
+            where_clause = "WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3"
 
         # Build ORDER BY clause using validated whitelist values
         order_clause = f"ORDER BY {sort_field} {sort_direction.upper()}"
@@ -3126,11 +3240,11 @@ class PGDocStatusStorage(DocStatusStorage):
                 )
                 return None
 
-        # Modified SQL to include created_at, updated_at, chunks_list, track_id, metadata, and error_msg in both INSERT and UPDATE operations
+        # Modified SQL to include created_at, updated_at, chunks_list, track_id, metadata, error_msg, tenant_id, and project_id
         # All fields are updated from the input data in both INSERT and UPDATE cases
-        sql = """insert into LIGHTRAG_DOC_STATUS(workspace,id,content_summary,content_length,chunks_count,status,file_path,chunks_list,track_id,metadata,error_msg,created_at,updated_at)
-                 values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-                  on conflict(id,workspace) do update set
+        sql = """insert into LIGHTRAG_DOC_STATUS(tenant_id,project_id,workspace,id,content_summary,content_length,chunks_count,status,file_path,chunks_list,track_id,metadata,error_msg,created_at,updated_at)
+                 values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                  on conflict(tenant_id,project_id,id,workspace) do update set
                   content_summary = EXCLUDED.content_summary,
                   content_length = EXCLUDED.content_length,
                   chunks_count = EXCLUDED.chunks_count,
@@ -3142,6 +3256,8 @@ class PGDocStatusStorage(DocStatusStorage):
                   error_msg = EXCLUDED.error_msg,
                   created_at = EXCLUDED.created_at,
                   updated_at = EXCLUDED.updated_at"""
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
         for k, v in data.items():
             # Remove timezone information, store utc time in db
             created_at = parse_datetime(v.get("created_at"))
@@ -3151,6 +3267,8 @@ class PGDocStatusStorage(DocStatusStorage):
             await self.db.execute(
                 sql,
                 {
+                    "tenant_id": tenant_id,
+                    "project_id": project_id,
                     "workspace": self.workspace,
                     "id": k,
                     "content_summary": v["content_summary"],
@@ -3170,8 +3288,10 @@ class PGDocStatusStorage(DocStatusStorage):
             )
 
     async def drop(self) -> dict[str, str]:
-        """Drop the storage"""
+        """Drop the storage - with multi-tenant isolation"""
         try:
+            tenant_id = self.tenant_id or "default"
+            project_id = self.project_id or "default"
             table_name = namespace_to_table_name(self.namespace)
             if not table_name:
                 return {
@@ -3182,7 +3302,14 @@ class PGDocStatusStorage(DocStatusStorage):
             drop_sql = SQL_TEMPLATES["drop_specifiy_table_workspace"].format(
                 table_name=table_name
             )
-            await self.db.execute(drop_sql, {"workspace": self.workspace})
+            await self.db.execute(
+                drop_sql,
+                {
+                    "tenant_id": tenant_id,
+                    "project_id": project_id,
+                    "workspace": self.workspace,
+                },
+            )
             return {"status": "success", "message": "data dropped"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -3215,28 +3342,29 @@ class PGGraphStorage(BaseGraphStorage):
 
     def _get_workspace_graph_name(self) -> str:
         """
-        Generate graph name based on workspace and namespace for data isolation.
+        Generate graph name based on tenant_id, project_id, workspace and namespace for data isolation.
         Rules:
-        - If workspace is empty or "default": graph_name = namespace
-        - If workspace has other value: graph_name = workspace_namespace
+        - Graph name = {tenant_id}_{project_id}_{workspace}_{namespace}
+        - All components are sanitized to PostgreSQL identifier specs
 
         Args:
             None
 
         Returns:
-            str: The graph name for the current workspace
+            str: The graph name for the current tenant/project/workspace
         """
-        workspace = self.workspace
+        tenant_id = self.tenant_id or "default"
+        project_id = self.project_id or "default"
+        workspace = self.workspace or "default"
         namespace = self.namespace
 
-        if workspace and workspace.strip() and workspace.strip().lower() != "default":
-            # Ensure names comply with PostgreSQL identifier specifications
-            safe_workspace = re.sub(r"[^a-zA-Z0-9_]", "_", workspace.strip())
-            safe_namespace = re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
-            return f"{safe_workspace}_{safe_namespace}"
-        else:
-            # When the workspace is "default", use the namespace directly (for backward compatibility with legacy implementations)
-            return re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
+        # Ensure names comply with PostgreSQL identifier specifications
+        safe_tenant = re.sub(r"[^a-zA-Z0-9_]", "_", tenant_id.strip())
+        safe_project = re.sub(r"[^a-zA-Z0-9_]", "_", project_id.strip())
+        safe_workspace = re.sub(r"[^a-zA-Z0-9_]", "_", workspace.strip())
+        safe_namespace = re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
+        
+        return f"{safe_tenant}_{safe_project}_{safe_workspace}_{safe_namespace}"
 
     @staticmethod
     def _normalize_node_id(node_id: str) -> str:
@@ -3271,12 +3399,12 @@ class PGGraphStorage(BaseGraphStorage):
                 # Use "default" for compatibility (lowest priority)
                 self.workspace = "default"
 
-            # Dynamically generate graph name based on workspace
+            # Dynamically generate graph name based on tenant, project, and workspace
             self.graph_name = self._get_workspace_graph_name()
 
             # Log the graph initialization for debugging
             logger.info(
-                f"[{self.workspace}] PostgreSQL Graph initialized: graph_name='{self.graph_name}'"
+                f"[tenant={self.tenant_id}][project={self.project_id}][workspace={self.workspace}] PostgreSQL Graph initialized: graph_name='{self.graph_name}'"
             )
 
             # Create AGE extension and configure graph environment once at initialization
@@ -4762,18 +4890,22 @@ TABLES = {
     "LIGHTRAG_DOC_FULL": {
         "ddl": """CREATE TABLE LIGHTRAG_DOC_FULL (
                     id VARCHAR(255),
+                    tenant_id VARCHAR(255) DEFAULT 'default',
+                    project_id VARCHAR(255) DEFAULT 'default',
                     workspace VARCHAR(255),
                     doc_name VARCHAR(1024),
                     content TEXT,
                     meta JSONB,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
-	                CONSTRAINT LIGHTRAG_DOC_FULL_PK PRIMARY KEY (workspace, id)
+	                CONSTRAINT LIGHTRAG_DOC_FULL_PK PRIMARY KEY (tenant_id, project_id, workspace, id)
                     )"""
     },
     "LIGHTRAG_DOC_CHUNKS": {
         "ddl": """CREATE TABLE LIGHTRAG_DOC_CHUNKS (
                     id VARCHAR(255),
+                    tenant_id VARCHAR(255) DEFAULT 'default',
+                    project_id VARCHAR(255) DEFAULT 'default',
                     workspace VARCHAR(255),
                     full_doc_id VARCHAR(256),
                     chunk_order_index INTEGER,
@@ -4783,12 +4915,14 @@ TABLES = {
                     llm_cache_list JSONB NULL DEFAULT '[]'::jsonb,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
-	                CONSTRAINT LIGHTRAG_DOC_CHUNKS_PK PRIMARY KEY (workspace, id)
+	                CONSTRAINT LIGHTRAG_DOC_CHUNKS_PK PRIMARY KEY (tenant_id, project_id, workspace, id)
                     )"""
     },
     "LIGHTRAG_VDB_CHUNKS": {
         "ddl": f"""CREATE TABLE LIGHTRAG_VDB_CHUNKS (
                     id VARCHAR(255),
+                    tenant_id VARCHAR(255) DEFAULT 'default',
+                    project_id VARCHAR(255) DEFAULT 'default',
                     workspace VARCHAR(255),
                     full_doc_id VARCHAR(256),
                     chunk_order_index INTEGER,
@@ -4798,12 +4932,14 @@ TABLES = {
                     file_path TEXT NULL,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
-	                CONSTRAINT LIGHTRAG_VDB_CHUNKS_PK PRIMARY KEY (workspace, id)
+	                CONSTRAINT LIGHTRAG_VDB_CHUNKS_PK PRIMARY KEY (tenant_id, project_id, workspace, id)
                     )"""
     },
     "LIGHTRAG_VDB_ENTITY": {
         "ddl": f"""CREATE TABLE LIGHTRAG_VDB_ENTITY (
                     id VARCHAR(255),
+                    tenant_id VARCHAR(255) DEFAULT 'default',
+                    project_id VARCHAR(255) DEFAULT 'default',
                     workspace VARCHAR(255),
                     entity_name VARCHAR(512),
                     content TEXT,
@@ -4812,12 +4948,14 @@ TABLES = {
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     chunk_ids VARCHAR(255)[] NULL,
                     file_path TEXT NULL,
-	                CONSTRAINT LIGHTRAG_VDB_ENTITY_PK PRIMARY KEY (workspace, id)
+	                CONSTRAINT LIGHTRAG_VDB_ENTITY_PK PRIMARY KEY (tenant_id, project_id, workspace, id)
                     )"""
     },
     "LIGHTRAG_VDB_RELATION": {
         "ddl": f"""CREATE TABLE LIGHTRAG_VDB_RELATION (
                     id VARCHAR(255),
+                    tenant_id VARCHAR(255) DEFAULT 'default',
+                    project_id VARCHAR(255) DEFAULT 'default',
                     workspace VARCHAR(255),
                     source_id VARCHAR(512),
                     target_id VARCHAR(512),
@@ -4827,11 +4965,13 @@ TABLES = {
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     chunk_ids VARCHAR(255)[] NULL,
                     file_path TEXT NULL,
-	                CONSTRAINT LIGHTRAG_VDB_RELATION_PK PRIMARY KEY (workspace, id)
+	                CONSTRAINT LIGHTRAG_VDB_RELATION_PK PRIMARY KEY (tenant_id, project_id, workspace, id)
                     )"""
     },
     "LIGHTRAG_LLM_CACHE": {
         "ddl": """CREATE TABLE LIGHTRAG_LLM_CACHE (
+                    tenant_id varchar(255) DEFAULT 'default',
+                    project_id varchar(255) DEFAULT 'default',
 	                workspace varchar(255) NOT NULL,
 	                id varchar(255) NOT NULL,
                     original_prompt TEXT,
@@ -4841,11 +4981,13 @@ TABLES = {
                     queryparam JSONB NULL,
                     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-	                CONSTRAINT LIGHTRAG_LLM_CACHE_PK PRIMARY KEY (workspace, id)
+	                CONSTRAINT LIGHTRAG_LLM_CACHE_PK PRIMARY KEY (tenant_id, project_id, workspace, id)
                     )"""
     },
     "LIGHTRAG_DOC_STATUS": {
         "ddl": """CREATE TABLE LIGHTRAG_DOC_STATUS (
+                   tenant_id varchar(255) DEFAULT 'default',
+                   project_id varchar(255) DEFAULT 'default',
 	               workspace varchar(255) NOT NULL,
 	               id varchar(255) NOT NULL,
 	               content_summary varchar(255) NULL,
@@ -4859,141 +5001,163 @@ TABLES = {
 	               error_msg TEXT NULL,
 	               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 	               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-	               CONSTRAINT LIGHTRAG_DOC_STATUS_PK PRIMARY KEY (workspace, id)
+	               CONSTRAINT LIGHTRAG_DOC_STATUS_PK PRIMARY KEY (tenant_id, project_id, workspace, id)
 	              )"""
     },
     "LIGHTRAG_FULL_ENTITIES": {
         "ddl": """CREATE TABLE LIGHTRAG_FULL_ENTITIES (
                     id VARCHAR(255),
+                    tenant_id VARCHAR(255) DEFAULT 'default',
+                    project_id VARCHAR(255) DEFAULT 'default',
                     workspace VARCHAR(255),
                     entity_names JSONB,
                     count INTEGER,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT LIGHTRAG_FULL_ENTITIES_PK PRIMARY KEY (workspace, id)
+                    CONSTRAINT LIGHTRAG_FULL_ENTITIES_PK PRIMARY KEY (tenant_id, project_id, workspace, id)
                     )"""
     },
     "LIGHTRAG_FULL_RELATIONS": {
         "ddl": """CREATE TABLE LIGHTRAG_FULL_RELATIONS (
                     id VARCHAR(255),
+                    tenant_id VARCHAR(255) DEFAULT 'default',
+                    project_id VARCHAR(255) DEFAULT 'default',
                     workspace VARCHAR(255),
                     relation_pairs JSONB,
                     count INTEGER,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT LIGHTRAG_FULL_RELATIONS_PK PRIMARY KEY (workspace, id)
+                    CONSTRAINT LIGHTRAG_FULL_RELATIONS_PK PRIMARY KEY (tenant_id, project_id, workspace, id)
                     )"""
     },
     "LIGHTRAG_ENTITY_CHUNKS": {
         "ddl": """CREATE TABLE LIGHTRAG_ENTITY_CHUNKS (
                     id VARCHAR(512),
+                    tenant_id VARCHAR(255) DEFAULT 'default',
+                    project_id VARCHAR(255) DEFAULT 'default',
                     workspace VARCHAR(255),
                     chunk_ids JSONB,
                     count INTEGER,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT LIGHTRAG_ENTITY_CHUNKS_PK PRIMARY KEY (workspace, id)
+                    CONSTRAINT LIGHTRAG_ENTITY_CHUNKS_PK PRIMARY KEY (tenant_id, project_id, workspace, id)
                     )"""
     },
     "LIGHTRAG_RELATION_CHUNKS": {
         "ddl": """CREATE TABLE LIGHTRAG_RELATION_CHUNKS (
                     id VARCHAR(512),
+                    tenant_id VARCHAR(255) DEFAULT 'default',
+                    project_id VARCHAR(255) DEFAULT 'default',
                     workspace VARCHAR(255),
                     chunk_ids JSONB,
                     count INTEGER,
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT LIGHTRAG_RELATION_CHUNKS_PK PRIMARY KEY (workspace, id)
+                    CONSTRAINT LIGHTRAG_RELATION_CHUNKS_PK PRIMARY KEY (tenant_id, project_id, workspace, id)
                     )"""
     },
 }
 
 
 SQL_TEMPLATES = {
-    # SQL for KVStorage
+    # SQL for KVStorage - All queries now include tenant_id and project_id for multi-tenant isolation
     "get_by_id_full_docs": """SELECT id, COALESCE(content, '') as content,
                                 COALESCE(doc_name, '') as file_path
-                                FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id=$2
+                                FROM LIGHTRAG_DOC_FULL 
+                                WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id=$4
                             """,
     "get_by_id_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
                                 chunk_order_index, full_doc_id, file_path,
                                 COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                FROM LIGHTRAG_DOC_CHUNKS WHERE workspace=$1 AND id=$2
+                                FROM LIGHTRAG_DOC_CHUNKS 
+                                WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id=$4
                             """,
     "get_by_id_llm_response_cache": """SELECT id, original_prompt, return_value, chunk_id, cache_type, queryparam,
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND id=$2
+                                FROM LIGHTRAG_LLM_CACHE 
+                                WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id=$4
                                """,
     "get_by_ids_full_docs": """SELECT id, COALESCE(content, '') as content,
                                  COALESCE(doc_name, '') as file_path
-                                 FROM LIGHTRAG_DOC_FULL WHERE workspace=$1 AND id = ANY($2)
+                                 FROM LIGHTRAG_DOC_FULL 
+                                 WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id = ANY($4)
                             """,
     "get_by_ids_text_chunks": """SELECT id, tokens, COALESCE(content, '') as content,
                                   chunk_order_index, full_doc_id, file_path,
                                   COALESCE(llm_cache_list, '[]'::jsonb) as llm_cache_list,
                                   EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                   EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                   FROM LIGHTRAG_DOC_CHUNKS WHERE workspace=$1 AND id = ANY($2)
+                                   FROM LIGHTRAG_DOC_CHUNKS 
+                                   WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id = ANY($4)
                                 """,
     "get_by_ids_llm_response_cache": """SELECT id, original_prompt, return_value, chunk_id, cache_type, queryparam,
                                  EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                  EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                 FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND id = ANY($2)
+                                 FROM LIGHTRAG_LLM_CACHE 
+                                 WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id = ANY($4)
                                 """,
     "get_by_id_full_entities": """SELECT id, entity_names, count,
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                FROM LIGHTRAG_FULL_ENTITIES WHERE workspace=$1 AND id=$2
+                                FROM LIGHTRAG_FULL_ENTITIES 
+                                WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id=$4
                                """,
     "get_by_id_full_relations": """SELECT id, relation_pairs, count,
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                FROM LIGHTRAG_FULL_RELATIONS WHERE workspace=$1 AND id=$2
+                                FROM LIGHTRAG_FULL_RELATIONS 
+                                WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id=$4
                                """,
     "get_by_ids_full_entities": """SELECT id, entity_names, count,
                                  EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                  EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                 FROM LIGHTRAG_FULL_ENTITIES WHERE workspace=$1 AND id = ANY($2)
+                                 FROM LIGHTRAG_FULL_ENTITIES 
+                                 WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id = ANY($4)
                                 """,
     "get_by_ids_full_relations": """SELECT id, relation_pairs, count,
                                  EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                  EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                 FROM LIGHTRAG_FULL_RELATIONS WHERE workspace=$1 AND id = ANY($2)
+                                 FROM LIGHTRAG_FULL_RELATIONS 
+                                 WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id = ANY($4)
                                 """,
     "get_by_id_entity_chunks": """SELECT id, chunk_ids, count,
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                FROM LIGHTRAG_ENTITY_CHUNKS WHERE workspace=$1 AND id=$2
+                                FROM LIGHTRAG_ENTITY_CHUNKS 
+                                WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id=$4
                                """,
     "get_by_id_relation_chunks": """SELECT id, chunk_ids, count,
                                 EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                 EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                FROM LIGHTRAG_RELATION_CHUNKS WHERE workspace=$1 AND id=$2
+                                FROM LIGHTRAG_RELATION_CHUNKS 
+                                WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id=$4
                                """,
     "get_by_ids_entity_chunks": """SELECT id, chunk_ids, count,
                                  EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                  EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                 FROM LIGHTRAG_ENTITY_CHUNKS WHERE workspace=$1 AND id = ANY($2)
+                                 FROM LIGHTRAG_ENTITY_CHUNKS 
+                                 WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id = ANY($4)
                                 """,
     "get_by_ids_relation_chunks": """SELECT id, chunk_ids, count,
                                  EXTRACT(EPOCH FROM create_time)::BIGINT as create_time,
                                  EXTRACT(EPOCH FROM update_time)::BIGINT as update_time
-                                 FROM LIGHTRAG_RELATION_CHUNKS WHERE workspace=$1 AND id = ANY($2)
+                                 FROM LIGHTRAG_RELATION_CHUNKS 
+                                 WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id = ANY($4)
                                 """,
-    "filter_keys": "SELECT id FROM {table_name} WHERE workspace=$1 AND id IN ({ids})",
-    "upsert_doc_full": """INSERT INTO LIGHTRAG_DOC_FULL (id, content, doc_name, workspace)
-                        VALUES ($1, $2, $3, $4)
-                        ON CONFLICT (workspace,id) DO UPDATE
-                           SET content = $2,
-                               doc_name = $3,
+    "filter_keys": "SELECT id FROM {table_name} WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3 AND id IN ({ids})",
+    "upsert_doc_full": """INSERT INTO LIGHTRAG_DOC_FULL (tenant_id, project_id, id, content, doc_name, workspace)
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        ON CONFLICT (tenant_id, project_id, workspace, id) DO UPDATE
+                           SET content = $4,
+                               doc_name = $5,
                                update_time = CURRENT_TIMESTAMP
                        """,
-    "upsert_llm_response_cache": """INSERT INTO LIGHTRAG_LLM_CACHE(workspace,id,original_prompt,return_value,chunk_id,cache_type,queryparam)
-                                      VALUES ($1, $2, $3, $4, $5, $6, $7)
-                                      ON CONFLICT (workspace,id) DO UPDATE
+    "upsert_llm_response_cache": """INSERT INTO LIGHTRAG_LLM_CACHE(tenant_id, project_id, workspace, id, original_prompt, return_value, chunk_id, cache_type, queryparam)
+                                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                                      ON CONFLICT (tenant_id, project_id, workspace, id) DO UPDATE
                                       SET original_prompt = EXCLUDED.original_prompt,
                                       return_value=EXCLUDED.return_value,
                                       chunk_id=EXCLUDED.chunk_id,
@@ -5001,11 +5165,11 @@ SQL_TEMPLATES = {
                                       queryparam=EXCLUDED.queryparam,
                                       update_time = CURRENT_TIMESTAMP
                                      """,
-    "upsert_text_chunk": """INSERT INTO LIGHTRAG_DOC_CHUNKS (workspace, id, tokens,
+    "upsert_text_chunk": """INSERT INTO LIGHTRAG_DOC_CHUNKS (tenant_id, project_id, workspace, id, tokens,
                       chunk_order_index, full_doc_id, content, file_path, llm_cache_list,
                       create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                      ON CONFLICT (workspace,id) DO UPDATE
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                      ON CONFLICT (tenant_id, project_id, workspace, id) DO UPDATE
                       SET tokens=EXCLUDED.tokens,
                       chunk_order_index=EXCLUDED.chunk_order_index,
                       full_doc_id=EXCLUDED.full_doc_id,
@@ -5014,44 +5178,44 @@ SQL_TEMPLATES = {
                       llm_cache_list=EXCLUDED.llm_cache_list,
                       update_time = EXCLUDED.update_time
                      """,
-    "upsert_full_entities": """INSERT INTO LIGHTRAG_FULL_ENTITIES (workspace, id, entity_names, count,
+    "upsert_full_entities": """INSERT INTO LIGHTRAG_FULL_ENTITIES (tenant_id, project_id, workspace, id, entity_names, count,
                       create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6)
-                      ON CONFLICT (workspace,id) DO UPDATE
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                      ON CONFLICT (tenant_id, project_id, workspace, id) DO UPDATE
                       SET entity_names=EXCLUDED.entity_names,
                       count=EXCLUDED.count,
                       update_time = EXCLUDED.update_time
                      """,
-    "upsert_full_relations": """INSERT INTO LIGHTRAG_FULL_RELATIONS (workspace, id, relation_pairs, count,
+    "upsert_full_relations": """INSERT INTO LIGHTRAG_FULL_RELATIONS (tenant_id, project_id, workspace, id, relation_pairs, count,
                       create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6)
-                      ON CONFLICT (workspace,id) DO UPDATE
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                      ON CONFLICT (tenant_id, project_id, workspace, id) DO UPDATE
                       SET relation_pairs=EXCLUDED.relation_pairs,
                       count=EXCLUDED.count,
                       update_time = EXCLUDED.update_time
                      """,
-    "upsert_entity_chunks": """INSERT INTO LIGHTRAG_ENTITY_CHUNKS (workspace, id, chunk_ids, count,
+    "upsert_entity_chunks": """INSERT INTO LIGHTRAG_ENTITY_CHUNKS (tenant_id, project_id, workspace, id, chunk_ids, count,
                       create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6)
-                      ON CONFLICT (workspace,id) DO UPDATE
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                      ON CONFLICT (tenant_id, project_id, workspace, id) DO UPDATE
                       SET chunk_ids=EXCLUDED.chunk_ids,
                       count=EXCLUDED.count,
                       update_time = EXCLUDED.update_time
                      """,
-    "upsert_relation_chunks": """INSERT INTO LIGHTRAG_RELATION_CHUNKS (workspace, id, chunk_ids, count,
+    "upsert_relation_chunks": """INSERT INTO LIGHTRAG_RELATION_CHUNKS (tenant_id, project_id, workspace, id, chunk_ids, count,
                       create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6)
-                      ON CONFLICT (workspace,id) DO UPDATE
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                      ON CONFLICT (tenant_id, project_id, workspace, id) DO UPDATE
                       SET chunk_ids=EXCLUDED.chunk_ids,
                       count=EXCLUDED.count,
                       update_time = EXCLUDED.update_time
                      """,
-    # SQL for VectorStorage
-    "upsert_chunk": """INSERT INTO LIGHTRAG_VDB_CHUNKS (workspace, id, tokens,
+    # SQL for VectorStorage - All queries now include tenant_id and project_id
+    "upsert_chunk": """INSERT INTO LIGHTRAG_VDB_CHUNKS (tenant_id, project_id, workspace, id, tokens,
                       chunk_order_index, full_doc_id, content, content_vector, file_path,
                       create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                      ON CONFLICT (workspace,id) DO UPDATE
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                      ON CONFLICT (tenant_id, project_id, workspace, id) DO UPDATE
                       SET tokens=EXCLUDED.tokens,
                       chunk_order_index=EXCLUDED.chunk_order_index,
                       full_doc_id=EXCLUDED.full_doc_id,
@@ -5060,10 +5224,10 @@ SQL_TEMPLATES = {
                       file_path=EXCLUDED.file_path,
                       update_time = EXCLUDED.update_time
                      """,
-    "upsert_entity": """INSERT INTO LIGHTRAG_VDB_ENTITY (workspace, id, entity_name, content,
+    "upsert_entity": """INSERT INTO LIGHTRAG_VDB_ENTITY (tenant_id, project_id, workspace, id, entity_name, content,
                       content_vector, chunk_ids, file_path, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6::varchar[], $7, $8, $9)
-                      ON CONFLICT (workspace,id) DO UPDATE
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::varchar[], $9, $10, $11)
+                      ON CONFLICT (tenant_id, project_id, workspace, id) DO UPDATE
                       SET entity_name=EXCLUDED.entity_name,
                       content=EXCLUDED.content,
                       content_vector=EXCLUDED.content_vector,
@@ -5071,10 +5235,10 @@ SQL_TEMPLATES = {
                       file_path=EXCLUDED.file_path,
                       update_time=EXCLUDED.update_time
                      """,
-    "upsert_relationship": """INSERT INTO LIGHTRAG_VDB_RELATION (workspace, id, source_id,
+    "upsert_relationship": """INSERT INTO LIGHTRAG_VDB_RELATION (tenant_id, project_id, workspace, id, source_id,
                       target_id, content, content_vector, chunk_ids, file_path, create_time, update_time)
-                      VALUES ($1, $2, $3, $4, $5, $6, $7::varchar[], $8, $9, $10)
-                      ON CONFLICT (workspace,id) DO UPDATE
+                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::varchar[], $10, $11, $12)
+                      ON CONFLICT (tenant_id, project_id, workspace, id) DO UPDATE
                       SET source_id=EXCLUDED.source_id,
                       target_id=EXCLUDED.target_id,
                       content=EXCLUDED.content,
@@ -5088,19 +5252,23 @@ SQL_TEMPLATES = {
                             r.target_id AS tgt_id,
                             EXTRACT(EPOCH FROM r.create_time)::BIGINT AS created_at
                      FROM LIGHTRAG_VDB_RELATION r
-                     WHERE r.workspace = $1
-                       AND r.content_vector <=> '[{embedding_string}]'::vector < $2
+                     WHERE r.tenant_id = $1
+                       AND r.project_id = $2
+                       AND r.workspace = $3
+                       AND r.content_vector <=> '[{embedding_string}]'::vector < $4
                      ORDER BY r.content_vector <=> '[{embedding_string}]'::vector
-                     LIMIT $3;
+                     LIMIT $5;
                      """,
     "entities": """
                 SELECT e.entity_name,
                        EXTRACT(EPOCH FROM e.create_time)::BIGINT AS created_at
                 FROM LIGHTRAG_VDB_ENTITY e
-                WHERE e.workspace = $1
-                  AND e.content_vector <=> '[{embedding_string}]'::vector < $2
+                WHERE e.tenant_id = $1
+                  AND e.project_id = $2
+                  AND e.workspace = $3
+                  AND e.content_vector <=> '[{embedding_string}]'::vector < $4
                 ORDER BY e.content_vector <=> '[{embedding_string}]'::vector
-                LIMIT $3;
+                LIMIT $5;
                 """,
     "chunks": """
               SELECT c.id,
@@ -5108,13 +5276,15 @@ SQL_TEMPLATES = {
                      c.file_path,
                      EXTRACT(EPOCH FROM c.create_time)::BIGINT AS created_at
               FROM LIGHTRAG_VDB_CHUNKS c
-              WHERE c.workspace = $1
-                AND c.content_vector <=> '[{embedding_string}]'::vector < $2
+              WHERE c.tenant_id = $1
+                AND c.project_id = $2
+                AND c.workspace = $3
+                AND c.content_vector <=> '[{embedding_string}]'::vector < $4
               ORDER BY c.content_vector <=> '[{embedding_string}]'::vector
-              LIMIT $3;
+              LIMIT $5;
               """,
-    # DROP tables
+    # DROP tables - Now filters by tenant_id and project_id for safe multi-tenant deletion
     "drop_specifiy_table_workspace": """
-        DELETE FROM {table_name} WHERE workspace=$1
+        DELETE FROM {table_name} WHERE tenant_id=$1 AND project_id=$2 AND workspace=$3
        """,
 }
